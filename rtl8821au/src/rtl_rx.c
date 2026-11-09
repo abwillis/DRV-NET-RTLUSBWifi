@@ -832,11 +832,11 @@ static void rx_parse(void)
       if (p[11] & 0x10)                           /* RX desc dw2 bit 28: a C2H report, not a received frame */
          rx_c2h(p + 24 + drv + sh, pl);
       else if (!(p[1] & 0xC0)) {                  /* skip CRC32 / ICV-error frames */
-         rx_stats(p, p + 24 + drv);
-         note_frame(p + 24 + drv, pl, rx_rssi(p, drv));
+         rx_stats(p, p + 24 + drv + sh);
+         note_frame(p + 24 + drv + sh, pl, rx_rssi(p, drv));
       } else
          g_ncrc++;
-      if ((p[3] & 0x04) && drv >= 16 && (p[24 + drv] & 0xFC) == 0x80) {   /* PHY-status layout probe */
+      if ((p[3] & 0x04) && drv >= 16 && (p[24 + drv + sh] & 0xFC) == 0x80) {   /* PHY-status layout probe */
          UCHAR isck = (UCHAR)((p[12] & 0x3F) <= 3);
          if ((isck && g_dbgc < 4) || (!isck && g_dbgo < 4)) {
             USHORT q;

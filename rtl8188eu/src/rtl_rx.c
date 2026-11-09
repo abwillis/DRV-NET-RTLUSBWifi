@@ -671,10 +671,10 @@ static void rx_parse(void)
          break;                                  /* wait for the rest            */
       g_rxsw = (UCHAR)(p[3] & 0x08);                /* RX desc dw0 bit 27: chip did not decrypt */
       if (!(p[1] & 0xC0))                         /* skip CRC32 / ICV-error frames */
-         note_frame(p + 24 + drv, pl, rx_rssi(p, drv));
+         note_frame(p + 24 + drv + sh, pl, rx_rssi(p, drv));
       else
          g_ncrc++;
-      if ((p[3] & 0x04) && drv >= 16 && (p[24 + drv] & 0xFC) == 0x80) {   /* PHY-status layout probe */
+      if ((p[3] & 0x04) && drv >= 16 && (p[24 + drv + sh] & 0xFC) == 0x80) {   /* PHY-status layout probe */
          UCHAR isck = (UCHAR)((p[12] & 0x3F) <= 3);
          if ((isck && g_dbgc < 4) || (!isck && g_dbgo < 4)) {
             USHORT q;

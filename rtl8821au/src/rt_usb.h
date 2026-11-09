@@ -109,6 +109,20 @@ typedef struct {
    UCHAR  endPointId;
 } RT_USBCANCEL;
 
+/* USBPRM 6.1.2.4: clear a stalled pipe. A NULL completion address requests no callback. */
+typedef struct {
+   UCHAR    controllerId;
+   UCHAR    deviceAddress;
+   UCHAR    endPointId;
+   ULONG    clientIDCAddr;
+   USHORT   clientDS;
+   ULONG    irqSwitchValue;
+   ULONG    requestData2;
+   ULONG    requestData3;
+   UCHAR    category;
+   RT_SETUP FAR *clearStalled;
+} RT_USBCLEARSTALL;
+
 /* USBPRM 6.1.3.4: detach device */
 typedef struct {
    UCHAR  controllerId;
@@ -250,6 +264,7 @@ void usb_mdelay(USHORT ms);
 #define USB_TXBUF     1620
 int    usb_rx_start(usb_dev_t *dev, UCHAR ep);
 void   usb_rx_stop(void);
+int    usb_rx_recover(usb_dev_t *dev);             /* task-time watchdog: clear STALL and restart */
 extern USHORT g_rx_run, g_rx_err, g_rx_errtot;
 USHORT usb_tx_alloc(void);                         /* slot 0..n-1, or 0xFFFF when all busy */
 UCHAR *usb_tx_buf(USHORT slot);                    /* the slot's frame buffer (USB_TXBUF)  */
@@ -301,8 +316,8 @@ int    ndis_set_mac(UCHAR *m);                     /* adopt the chip address int
 /* DHCP client inside the driver (rtl_dhcp.c): a read of the device runs the exchange */
 extern USHORT g_lannum;                  /* rt_ndis.c: TCP/IP interface number (lanN) of this adapter */
 void   ndis_find_lan(void);              /* rt_ndis.c: derive g_lannum from PROTOCOL.INI */
-void   dhcp_init(void);
-void   dbg_init(void);
+int    dhcp_init(void);
+int    dbg_init(void);
 void   rtl8188eu_dbg_write(ULONG phys, USHORT n);   /* run a command line written to the device */
 int    efuse_byte(usb_dev_t *dev, USHORT addr, UCHAR *out);
 void   efuse_power(usb_dev_t *dev, int on);

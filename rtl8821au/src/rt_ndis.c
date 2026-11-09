@@ -135,7 +135,8 @@ USHORT ndis_init(void)
    USHORT          rc, i;
 
    gCCT.moduleDS = rt_getds();
-   rt_dh_alloc_gdt(&g_txsel, 1);                   /* used to read physical TransmitChain data blocks */
+   if (rt_dh_alloc_gdt(&g_txsel, 1) != 0)          /* used to read physical TransmitChain data blocks */
+      return 3;
    g_hook_ok = (USHORT)(rt_dh_alloc_ctxhook(rt_hook_offset(), &g_hook) == 0);   /* receive delivery at task time */
    for (i = 0; i < 6; i++)
       gSCT.permStnAddr[i] = gSCT.currStnAddr[i] = g_mymac[i];
@@ -318,7 +319,7 @@ static void deliver(USHORT h, USHORT len)
 
 /* ---- NDIS entry points (DS is the driver's on entry: loaded by the stubs) ------------------------- */
 
-/* System request: Bind is the only one we implement. */
+/* System requests: bind a protocol, or release that binding during a stack restart. */
 WORD __cdecl ndis_c_sysreq(DWORD param1, DWORD param2, WORD param3, WORD opcode)
 {
    WORD   rc;
@@ -326,15 +327,21 @@ WORD __cdecl ndis_c_sysreq(DWORD param1, DWORD param2, WORD param3, WORD opcode)
 
    if (!g_ndis_reg)
       rc = NDIS_DRIVER_NOT_INIT;
-   else if (opcode != SYSTEM_REQUEST_BIND)
+   else if (opcode == SYSTEM_REQUEST_UNBIND) {
+      gSST.status &= (USHORT)~(SSTATUS_BOUND | SSTATUS_OPEN);
+      gSST.filter = 0;                            /* queued receive work now drops without an upcall */
+      rc = NDIS_SUCCESS;
+   } else if (opcode != SYSTEM_REQUEST_BIND)
       rc = NDIS_INVALID_FUNCTION;
-   else if (param1 == 0 || param3 != 0)
+   else if (param1 == 0 || param2 == 0 || param3 != 0)
       rc = NDIS_INVALID_PARAMETER;
    else if (gSST.status & SSTATUS_BOUND)
       rc = NDIS_ALREADY_STARTED;
    else {
       PCCT pc = (PCCT)param1;                      /* far pointer values passed as dwords */
 
+      if (pc->pLowDisp == 0)
+         return NDIS_INVALID_PARAMETER;
       if (rtl8188eu_early_mac() == 0)             /* real (eFuse) address before the protocol copies it */
          for (i = 0; i < 6; i++)
             gSCT.permStnAddr[i] = gSCT.currStnAddr[i] = g_mymac[i];
@@ -435,8 +442,10 @@ WORD __cdecl ndis_c_transmit(WORD protID, WORD reqHandle, PTCBD pTCBufferD)
             bad = 1;
             break;
          }
-         rt_dh_phys_to_gdt(ph, k, g_txsel);
-         rt_movmem((PVOID)(g + n), MAKEP(g_txsel, 0), k);
+         if (rt_dh_phys_to_gdt(ph, k, g_txsel) != 0)
+            bad = 1;
+         else
+            rt_movmem((PVOID)(g + n), MAKEP(g_txsel, 0), k);
          rt_lock_release(&g_txsel_lock);
          rt_irq_restore(fl);
       } else {                                          /* GDT virtual address */
@@ -539,14 +548,15 @@ int ndis_set_mac(UCHAR *m)
 
 /* Delivery from the context hook: the frame is queued by the USB completion callback and the hook runs the protocol's
  * receive upcall at task time (the way other USB network drivers do it). */
-static UCHAR  g_q_h[RXP_N];
-static USHORT g_q_len[RXP_N];
+#define RXP_QN 8
+static UCHAR  g_q_h[RXP_QN];
+static USHORT g_q_len[RXP_QN];
 
 void __cdecl ndis_hook_c(void)
 {
    g_hk_run++;
    while (g_q_tail != g_q_head) {
-      USHORT i = (USHORT)(g_q_tail % RXP_N), h, len;
+      USHORT i = (USHORT)(g_q_tail & (RXP_QN - 1)), h, len;
 
       if (g_ind_off != 0)                          /* the protocol has indications off: IndicationOn re-arms us */
          return;
@@ -573,8 +583,8 @@ void ndis_rx_put(USHORT h, USHORT len)
       g_rxp_busy[h] = 0;
       return;
    }
-   g_q_h[g_q_head % RXP_N]   = (UCHAR)h;
-   g_q_len[g_q_head % RXP_N] = len;
+   g_q_h[g_q_head & (RXP_QN - 1)]   = (UCHAR)h;
+   g_q_len[g_q_head & (RXP_QN - 1)] = len;
    rt_atomic_inc(&g_q_head);                        /* publish the entry (locked instruction = barrier) */
    {
       USHORT q = (USHORT)(g_q_head - g_q_tail);

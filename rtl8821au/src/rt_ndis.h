@@ -74,6 +74,7 @@ typedef BYTE FAR      *PBYTE;
 
 /* system request opcodes and MAC request opcodes */
 #define SYSTEM_REQUEST_BIND        2
+#define SYSTEM_REQUEST_UNBIND      5
 #define INITIATE_DIAGNOSTICS       1
 #define READ_ERROR_LOG             2
 #define SET_STATION_ADDRESS        3

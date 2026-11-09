@@ -35,11 +35,31 @@ extern UCHAR g_mgmtrate;                /* rtl_rx.c */
 
 extern USHORT g_dump_base;              /* rtl_dhcp.c */
 static USHORT g_wrsel;                 /* GDT selector to read the caller's buffer */
+static UCHAR  g_wrsel_busy;
+static USHORT g_wrsel_awake;
+#define WRSEL_EVENT ((ULONG)(UCHAR FAR *)&g_wrsel_busy)
+
+static void wrsel_lock(void)
+{
+   rt_cli();
+   while (rt_tas(&g_wrsel_busy)) {
+      rt_dh_procblock(WRSEL_EVENT, 50UL, WAIT_UNINTERRUPTIBLE);
+      rt_cli();
+   }
+   rt_sti();
+}
+
+static void wrsel_unlock(void)
+{
+   g_wrsel_busy = 0;
+   rt_dh_procrun(WRSEL_EVENT, &g_wrsel_awake);
+}
 static char   g_cmd[72];
 
-void dbg_init(void)
+int dbg_init(void)
 {
-   rt_dh_alloc_gdt(&g_wrsel, 1);
+   g_wrsel = 0;
+   return rt_dh_alloc_gdt(&g_wrsel, 1) == 0 ? 0 : -1;
 }
 
 static void d8(UCHAR b)
@@ -84,8 +104,15 @@ void rtl8188eu_dbg_write(ULONG phys, USHORT n)
    if (n == 0)
       return;
    if (n > sizeof(g_cmd) - 1) n = sizeof(g_cmd) - 1;
-   rt_dh_phys_to_gdt(phys, n, g_wrsel);
+   if (g_wrsel == 0)
+      return;
+   wrsel_lock();
+   if (rt_dh_phys_to_gdt(phys, n, g_wrsel) != 0) {
+      wrsel_unlock();
+      return;
+   }
    rt_movmem((PSZ)g_cmd, (PSZ)MAKEP(g_wrsel, 0), n);
+   wrsel_unlock();
    g_cmd[n] = 0;
    for (i = 0; i < n; i++)                       /* stop at CR / LF / EOF */
       if (g_cmd[i] == '\r' || g_cmd[i] == '\n' || g_cmd[i] == 0x1A) { g_cmd[i] = 0; break; }

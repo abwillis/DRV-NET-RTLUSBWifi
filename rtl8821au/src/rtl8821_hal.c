@@ -68,6 +68,25 @@ USHORT g_r21_tried;                         /* the bring-up was started by the f
 static ULONG  g_fw_phys;                   /* AllocPhys block holding the image */
 static USHORT g_fw_sel;                    /* GDT selector used to read it */
 static USHORT g_fw_sels[2];                /* [0] image buffer, [1] the caller's buffer of a write */
+static UCHAR  g_fwsel_busy;
+static USHORT g_fwsel_awake;
+#define FWSEL_EVENT ((ULONG)(UCHAR FAR *)&g_fwsel_busy)
+
+static void fwsel_lock(void)
+{
+   rt_cli();
+   while (rt_tas(&g_fwsel_busy)) {
+      rt_dh_procblock(FWSEL_EVENT, 50UL, WAIT_UNINTERRUPTIBLE);
+      rt_cli();
+   }
+   rt_sti();
+}
+
+static void fwsel_unlock(void)
+{
+   g_fwsel_busy = 0;
+   rt_dh_procrun(FWSEL_EVENT, &g_fwsel_awake);
+}
 
 /* ---- firmware image ------------------------------------------------------------------------------------
  * INIT runs at ring 3, where a GDT selector from PhysToGDTSelector cannot be used, so INIT only allocates the buffer
@@ -100,12 +119,22 @@ int rtl8821_fw_write(ULONG phys, USHORT n)
 
    if (n < 64U || n > (USHORT)FW_MAXLEN || g_fw_sel == 0)
       return 0;
-   rt_dh_phys_to_gdt(phys, n, g_fw_sels[1]);
-   rt_movmem((PVOID)hdr, MAKEP(g_fw_sels[1], 0), 2);
-   if (hdr[0] != 0x01 || hdr[1] != 0x21)
+   fwsel_lock();
+   if (rt_dh_phys_to_gdt(phys, n, g_fw_sels[1]) != 0) {
+      fwsel_unlock();
       return 0;
-   rt_dh_phys_to_gdt(g_fw_phys, n, g_fw_sel);
+   }
+   rt_movmem((PVOID)hdr, MAKEP(g_fw_sels[1], 0), 2);
+   if (hdr[0] != 0x01 || hdr[1] != 0x21) {
+      fwsel_unlock();
+      return 0;
+   }
+   if (rt_dh_phys_to_gdt_sel(g_fw_phys, n, g_fw_sel, GDTSEL_R0DATA) != 0) {
+      fwsel_unlock();
+      return 0;
+   }
    rt_movmem(MAKEP(g_fw_sel, 0), MAKEP(g_fw_sels[1], 0), n);
+   fwsel_unlock();
    g_r21_fwlen = n;
    g_r21_fwload = 0;
    g_hw_failed = 0;                                  /* the chip may now be started (again) */
@@ -116,10 +145,17 @@ int rtl8821_fw_write(ULONG phys, USHORT n)
 }
 
 /* copy n bytes of the image from offset off into dst (task time) */
-static void fw_get(ULONG off, UCHAR *dst, USHORT n)
+static int fw_get(ULONG off, UCHAR *dst, USHORT n)
 {
-   rt_dh_phys_to_gdt(g_fw_phys + off, n, g_fw_sel);
-   rt_movmem((PVOID)dst, MAKEP(g_fw_sel, 0), n);
+   int rc = -1;
+
+   fwsel_lock();
+   if (rt_dh_phys_to_gdt(g_fw_phys + off, n, g_fw_sel) == 0) {
+      rt_movmem((PVOID)dst, MAKEP(g_fw_sel, 0), n);
+      rc = 0;
+   }
+   fwsel_unlock();
+   return rc;
 }
 
 /* ---- power-on flow --------------------------------------------------------------------------------------
@@ -304,7 +340,8 @@ static UCHAR g_chunk[196];
 
 static int fw_write_block(usb_dev_t *dev, ULONG imgoff, USHORT addr, USHORT n)
 {
-   fw_get(imgoff, g_chunk, n);
+   if (fw_get(imgoff, g_chunk, n) != 0)
+      return -1;
    return rtw_writeN(dev, addr, n, g_chunk) == 0 ? 0 : -1;
 }
 
@@ -328,7 +365,8 @@ static int fw_write_page(usb_dev_t *dev, USHORT page, ULONG imgoff, USHORT size)
       done = (USHORT)(done + 8);
    }
    while (done < size) {
-      fw_get(imgoff + done, g_chunk, 1);
+      if (fw_get(imgoff + done, g_chunk, 1) != 0)
+         return -1;
       rtw_write8(dev, (USHORT)(a + done), g_chunk[0]);
       done++;
    }
@@ -345,7 +383,8 @@ static int r21_fw_download(usb_dev_t *dev)
 
    if (g_r21_fwlen < 64U)
       return -2;                                    /* no image in memory */
-   fw_get(0UL, hdr, 4);
+   if (fw_get(0UL, hdr, 4) != 0)
+      return -1;
    g_r21_fwsig = (USHORT)(hdr[0] | ((USHORT)hdr[1] << 8));
    imgoff = 0;
    remain = g_r21_fwlen;

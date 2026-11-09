@@ -149,7 +149,9 @@ extern USHORT __cdecl rt_dh_procblock(ULONG id, ULONG timeout, USHORT flag);   /
 extern USHORT __cdecl rt_dh_procrun(ULONG id, USHORT *awake);
 extern USHORT __cdecl rt_dh_verify(USHORT sel, USHORT len, USHORT off, UCHAR type);   /* 0 = access ok */
 extern USHORT __cdecl rt_dh_alloc_gdt(USHORT *sel, USHORT count);                    /* 0 = ok */
-extern USHORT __cdecl rt_dh_phys_to_gdt(ULONG phys, USHORT len, USHORT sel);        /* 0 = ok */
+extern USHORT __cdecl rt_dh_phys_to_gdt(ULONG phys, USHORT len, USHORT sel);        /* read-only mapping; 0 = ok */
+extern USHORT __cdecl rt_dh_phys_to_gdt_sel(ULONG phys, USHORT len, USHORT sel, UCHAR access); /* 0 = ok */
+#define GDTSEL_R0DATA  6
 extern USHORT __cdecl rt_dh_virt_to_phys(PVOID p, ULONG *phys);                      /* 0 = ok */
 extern USHORT __cdecl rt_dh_getdosvar(USHORT index, USHORT member, PPVOID out);      /* 0 = ok */
 extern USHORT __cdecl rt_dh_attach_dd(char *name, USHORT *table);                      /* 0 = ok; table = 6 words */

@@ -42,14 +42,34 @@ static USHORT g_xcount;
 static UCHAR  g_ip[4], g_mask[4], g_router[4], g_dns[4], g_srv[4], g_lease[4];
 static UCHAR  g_have_router, g_have_dns, g_have_mask;
 static USHORT g_rdsel;                 /* GDT selector used to write into the caller's buffer */
+static UCHAR  g_rdsel_busy;
+static USHORT g_rdsel_awake;
+#define RDSEL_EVENT ((ULONG)(UCHAR FAR *)&g_rdsel_busy)
+
+static void rdsel_lock(void)
+{
+   rt_cli();
+   while (rt_tas(&g_rdsel_busy)) {
+      rt_dh_procblock(RDSEL_EVENT, 50UL, WAIT_UNINTERRUPTIBLE);
+      rt_cli();
+   }
+   rt_sti();
+}
+
+static void rdsel_unlock(void)
+{
+   g_rdsel_busy = 0;
+   rt_dh_procrun(RDSEL_EVENT, &g_rdsel_awake);
+}
 static char   g_text[3900];
 static USHORT g_tlen;
 static UCHAR  g_olen;
 static UCHAR  g_opt_len;
 
-void dhcp_init(void)
+int dhcp_init(void)
 {
-   rt_dh_alloc_gdt(&g_rdsel, 1);
+   g_rdsel = 0;
+   return rt_dh_alloc_gdt(&g_rdsel, 1) == 0 ? 0 : -1;
 }
 
 static USHORT dh_ipsum(UCHAR *p, USHORT n)
@@ -516,9 +536,14 @@ USHORT rtl8188eu_dhcp_read(ULONG phys, USHORT max)
    }
    n = g_tlen;
    if (n > max) n = max;
-   if (n) {
-      rt_dh_phys_to_gdt(phys, n, g_rdsel);
-      rt_movmem((PSZ)MAKEP(g_rdsel, 0), (PSZ)g_text, n);
-   }
+   if (n && g_rdsel) {
+      rdsel_lock();
+      if (rt_dh_phys_to_gdt_sel(phys, n, g_rdsel, GDTSEL_R0DATA) == 0)
+         rt_movmem((PSZ)MAKEP(g_rdsel, 0), (PSZ)g_text, n);
+      else
+         n = 0;
+      rdsel_unlock();
+   } else if (n)
+      n = 0;
    return n;
 }

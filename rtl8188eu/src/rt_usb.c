@@ -74,11 +74,14 @@ static USHORT  g_xwait;                          /* tasks waiting for the lock (
 
 void usb_xfer_lock(void)
 {
+   rt_cli();
    while (rt_tas(&g_xlock)) {
       rt_atomic_inc(&g_xwait);
-      rt_dh_procblock(EVT_XLOCK, 20UL, WAIT_UNINTERRUPTIBLE);   /* short: a ProcRun just before the block is lost */
+      rt_dh_procblock(EVT_XLOCK, 20UL, WAIT_UNINTERRUPTIBLE);
       rt_atomic_dec(&g_xwait);
+      rt_cli();                                  /* ProcBlock returns enabled: re-disable before re-testing */
    }
+   rt_sti();
 }
 
 void usb_xfer_unlock(void)
@@ -220,6 +223,21 @@ void usb_unregister_client(void)
 }
 
 /* ---- completion plumbing (submit g_xfer, wait) -------------------------------------- */
+/* Test the completion flag with interrupts disabled, as required by ProcBlock/ProcRun. ProcBlock returns with
+ * interrupts enabled, so disable them again before sampling the condition. */
+static USHORT xfer_wait(ULONG timeout)
+{
+   USHORT done;
+
+   rt_cli();
+   if (!g_xfer.done)
+      rt_dh_procblock(EVT_XFER, timeout, WAIT_INTERRUPTIBLE);
+   rt_cli();
+   done = g_xfer.done;
+   rt_sti();
+   return done;
+}
+
 /* Caller holds usb_xfer_lock. tgl != 0 (bulk OUT): *tgl is the endpoint's toggle; it is applied to the request and
  * advanced by flip (the parity of the packet count) in the same locked step as the submission, like the async TX
  * path, so the two paths can share an endpoint. */
@@ -252,24 +270,16 @@ static int usb_submit_wait(UCHAR *tgl, UCHAR flip)
    if (st & STERR)
       return -1;
 
-   /* Block until the completion handler runs us. Finite timeout so a lost wakeup or a completion that never
-    * arrives cannot hang the caller. Re-check 'done' after: if the wakeup raced ahead of the block, ProcBlock
-    * just waits out the timeout and we still see done=1. Only called at task time. */
-   if (!g_xfer.done)
-      rt_dh_procblock(EVT_XFER, (ULONG)g_xfer_timeout_ms, WAIT_INTERRUPTIBLE);
-
-   if (!g_xfer.done) {
-      /* Timed out. A bulk request stays queued inside USBD pointing at g_xfer.rb, which the NEXT request would
-       * overwrite - so cancel it and wait for its (canceled) completion before returning. (Control: endpoint 0,
-       * short-lived, left as it is.) */
-      if (g_xfer.rb.endPointId != 0) {
-         g_cancel.controllerId  = g_xfer.rb.controllerId;
-         g_cancel.deviceAddress = g_xfer.rb.deviceAddress;
-         g_cancel.endPointId    = g_xfer.rb.endPointId;
-         usbd_call(USB_IDC_FUNCTION_CANCEL, (PVOID)&g_cancel);
-         if (!g_xfer.done)
-            rt_dh_procblock(EVT_XFER, 1000UL, WAIT_INTERRUPTIBLE);
-      }
+   /* Block until the completion handler runs us. The test/block pair is atomic with respect to the local
+    * completion interrupt, and the finite timeout still bounds a request the controller never completes. */
+   if (!xfer_wait((ULONG)g_xfer_timeout_ms)) {
+      /* Timed out or interrupted. Cancel every endpoint, including ep0: a late control completion must not
+       * remain queued while the single g_xfer request block is reused by the next transfer. */
+      g_cancel.controllerId  = g_xfer.rb.controllerId;
+      g_cancel.deviceAddress = g_xfer.rb.deviceAddress;
+      g_cancel.endPointId    = g_xfer.rb.endPointId;
+      usbd_call(USB_IDC_FUNCTION_CANCEL, (PVOID)&g_cancel);
+      xfer_wait(1000UL);
       return -1;                       /* timed out / interrupted - no data */
    }
 
@@ -332,6 +342,18 @@ static USHORT tgl_packets(USHORT len, USHORT mps)
    if (mps == 0 || len == 0)
       return 1;                                /* a zero-length transfer is one (empty) packet */
    return (USHORT)((len + mps - 1) / mps);
+}
+
+static USHORT rx_tgl_packets(USHORT len, USHORT requested, USHORT mps)
+{
+   USHORT n;
+
+   if (mps == 0)
+      mps = 512;
+   n = (USHORT)(len / mps);
+   if ((USHORT)(len % mps) != 0 || len < requested)
+      n++;                                    /* short packet, or the ZLP after exact full packets */
+   return n;
 }
 
 /* Max packet size of a bulk endpoint, from the cached configuration descriptor: 512 when the dongle runs at high
@@ -425,6 +447,15 @@ int usb_set_configuration(usb_dev_t *dev, UCHAR configValue)
 
 static void async_complete(RT_USBRB FAR *rb);   /* async RX/TX completions (end of file) */
 
+static UCHAR device_config_value(RT_DEVINFO FAR *di)
+{
+   UCHAR FAR *p = di->configurationData;
+
+   if (p[0] >= 6 && p[1] == 2 && p[5] != 0)       /* USB configuration descriptor */
+      return p[5];
+   return 1;
+}
+
 /* ---- the IDC routine USBD calls ----------------------------------------------------- */
 static void idc_body(RP_GENIOCTL FAR *pRP);
 
@@ -480,10 +511,16 @@ static void idc_body(RP_GENIOCTL FAR *pRP)
       RT_DEVINFO  FAR *di = cd->pDeviceInfo;
       if (di &&
           di->descriptor.idVendor  == RTL8188EU_VID &&
-          di->descriptor.idProduct == RTL8188EU_PID) {
+          di->descriptor.idProduct == RTL8188EU_PID &&
+          (!g_usbdev.attached ||
+           (g_usbdev.ctrlId == di->ctrlID && g_usbdev.devAddr == di->deviceAddress))) {
+         UCHAR cfg = device_config_value(di);
+
+         di->bConfigurationValue = cfg;             /* reserve the device and ask USBD to select this configuration */
          g_usbdev.pDevInfo  = di;
          g_usbdev.ctrlId    = di->ctrlID;
          g_usbdev.devAddr   = di->deviceAddress;
+         g_usbdev.configValue = cfg;
          g_usbdev.attached  = 1;
          rt_setmem((PVOID)g_tgl_out, 0, sizeof(g_tgl_out));      /* fresh device: every bulk endpoint starts on DATA0 */
          rt_setmem((PVOID)g_tgl_in, 0, sizeof(g_tgl_in));
@@ -621,6 +658,23 @@ USHORT usb_phys(USHORT i, USHORT half)
    return u.w[half ? 1 : 0];
 }
 
+static int usb_clear_stall(usb_dev_t *dev, UCHAR ep)
+{
+   static RT_USBCLEARSTALL rd;
+   static RT_SETUP setup;
+   USHORT st;
+
+   rt_setmem((PVOID)&rd, 0, sizeof(rd));
+   rt_setmem((PVOID)&setup, 0, sizeof(setup));
+   rd.controllerId  = dev->ctrlId;
+   rd.deviceAddress = dev->devAddr;
+   rd.endPointId    = ep;
+   rd.category      = USB_IDC_CATEGORY_CLIENT;
+   rd.clearStalled  = (RT_SETUP FAR *)&setup;
+   st = usbd_call(USB_IDC_FUNCTION_CLRSTALL, (PVOID)&rd);
+   return (st & STERR) ? -1 : 0;
+}
+
 int usb_rx_start(usb_dev_t *dev, UCHAR ep)
 {
    USHORT st;
@@ -656,6 +710,23 @@ int usb_rx_start(usb_dev_t *dev, UCHAR ep)
 void usb_rx_stop(void)
 {
    g_rx_run = 0;                       /* the outstanding request just won't be resubmitted */
+}
+
+int usb_rx_recover(usb_dev_t *dev)
+{
+   UCHAR ep;
+
+   if (!dev->attached || g_rx_run)
+      return 0;
+   ep = g_rx_ep;
+   if (ep == 0)
+      return -1;
+   if (usb_clear_stall(dev, ep) != 0)  /* harmless if the stop was not caused by STALL */
+      return -1;
+   usb_mdelay(10);                     /* CLRSTALL itself is asynchronous when no callback is requested */
+   g_rx_err = 0;
+   g_tgl_in[ep & 0x0F] = 0;              /* CLEAR_FEATURE(ENDPOINT_HALT) resets the data toggle to DATA0 */
+   return usb_rx_start(dev, ep);
 }
 
 /* A transmit request that the device never takes (its FIFO stays full, or a completion is lost) keeps its slot busy for
@@ -814,7 +885,8 @@ static void async_complete(RT_USBRB FAR *rb)
       g_rx_laststat = (USHORT)rb->status;
       g_rx_lastn = n;
       if (rb->status == 0) {
-         UCHAR pred = (UCHAR)(g_tgl_in[g_rx_ep & 0x0F] ^ (tgl_packets(n, 512) & 1));
+         UCHAR pred = (UCHAR)(g_tgl_in[g_rx_ep & 0x0F] ^
+                              (rx_tgl_packets(n, USB_RXBUF, g_rxrb.maxPacketSize) & 1));
          UCHAR ret  = (UCHAR)((rb->flags & USRB_FLAGS_DET_DTGGLEON) ? 1 : 0);   /* toggle of the last packet, as the controller saw it */
 
          g_tgl_pred = pred;

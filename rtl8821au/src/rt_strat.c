@@ -26,8 +26,65 @@
 #include "rt_usb.h"
 #include "rt_ndis.h"
 
-/* ---- driver globals ---------------------------------------------------------- */
-static USHORT g_rd_pending;            /* an open handle has not read yet: that read runs DHCP */
+/* ---- per-open read state ------------------------------------------------------ */
+#define RD_OPEN_MAX 8
+static USHORT g_rd_sfn[RD_OPEN_MAX];
+static UCHAR  g_rd_used[RD_OPEN_MAX], g_rd_pending[RD_OPEN_MAX];
+static USHORT g_rd_lock;
+
+static int rd_open(USHORT sfn)
+{
+   USHORT i, freei = RD_OPEN_MAX, fl = rt_irq_save();
+
+   rt_lock_acquire(&g_rd_lock, (USHORT)(rt_cpu_id() + 1));
+   for (i = 0; i < RD_OPEN_MAX; i++) {
+      if (g_rd_used[i] && g_rd_sfn[i] == sfn) {
+         g_rd_pending[i] = 1;
+         rt_lock_release(&g_rd_lock);
+         rt_irq_restore(fl);
+         return 0;
+      }
+      if (!g_rd_used[i] && freei == RD_OPEN_MAX)
+         freei = i;
+   }
+   if (freei != RD_OPEN_MAX) {
+      g_rd_used[freei] = g_rd_pending[freei] = 1;
+      g_rd_sfn[freei] = sfn;
+   }
+   rt_lock_release(&g_rd_lock);
+   rt_irq_restore(fl);
+   return freei == RD_OPEN_MAX ? -1 : 0;
+}
+
+static int rd_take(USHORT sfn)
+{
+   USHORT i, yes = 0, fl = rt_irq_save();
+
+   rt_lock_acquire(&g_rd_lock, (USHORT)(rt_cpu_id() + 1));
+   for (i = 0; i < RD_OPEN_MAX; i++)
+      if (g_rd_used[i] && g_rd_sfn[i] == sfn) {
+         yes = g_rd_pending[i];
+         g_rd_pending[i] = 0;
+         break;
+      }
+   rt_lock_release(&g_rd_lock);
+   rt_irq_restore(fl);
+   return yes;
+}
+
+static void rd_close(USHORT sfn)
+{
+   USHORT i, fl = rt_irq_save();
+
+   rt_lock_acquire(&g_rd_lock, (USHORT)(rt_cpu_id() + 1));
+   for (i = 0; i < RD_OPEN_MAX; i++)
+      if (g_rd_used[i] && g_rd_sfn[i] == sfn) {
+         g_rd_used[i] = g_rd_pending[i] = 0;
+         break;
+      }
+   rt_lock_release(&g_rd_lock);
+   rt_irq_restore(fl);
+}
 
 /* ---- boot messages (EDM2 "Suggestion for OS/2 and eComStation Drivers Arguments") ----
  * Default: silent, only an error is shown when the driver cannot load.
@@ -159,8 +216,8 @@ static void rt_init(RP_INIT FAR *rp)
    else if (g_opt_v)
       say("RTL8821AU: firmware buffer ready; load the image with: copy /b \\IBMCOM\\MACS\\RTL8821AU.FW \\DEV\\WRND32$");
    tcom_always('I'); tcom_always('5');
-   dhcp_init();                         /* GDT selector for returning the DHCP lease on a device read */
-   dbg_init();
+   if (dhcp_init() != 0 || dbg_init() != 0)      /* mapping calls also reject a missing selector */
+      say("RTL8821AU: warning - GDT selector allocation failed; the text READ/WRITE channel is disabled.");
    tcom_always('I'); tcom_always('6');
 
    /* Registration with USBD is deferred to INIT COMPLETE: during INIT the USB stack is not yet ready to accept a
@@ -194,12 +251,16 @@ void __cdecl rt_strategy(RPH FAR *rp)
       rt_initdone(rp);
       break;
 
-   case CMD_OPEN:
-      g_rd_pending = 1;                /* the next read on this open returns the DHCP lease */
-      /* (no chip init here: it starts on the first GenMAC request, so the device can be opened for the debug
-       *  channel / DHCP read with the chip still in its cold state) */
-      rp->Status |= STDON;
+   case CMD_OPEN: {
+      RP_OPENCLOSE FAR *oc = (RP_OPENCLOSE FAR *)rp;
+
+      /* Each SFN gets its own one-shot read; one process opening the device no longer consumes another's read. */
+      if (rd_open(oc->sfn) != 0)
+         rp->Status |= STDON | STERR | ERROR_I24_GEN_FAILURE;
+      else
+         rp->Status |= STDON;
       break;
+   }
 
    case CMD_WRITE: {
       /* a command line for the debug channel (rtl_dbg.c) */
@@ -216,10 +277,8 @@ void __cdecl rt_strategy(RPH FAR *rp)
       RP_RW FAR *rw = (RP_RW FAR *)rp;
       USHORT     n = 0;
 
-      if (g_rd_pending) {
-         g_rd_pending = 0;
+      if (rd_take(rw->sfn))
          n = rtl8188eu_dhcp_read(rw->Xfer, rw->Count);
-      }
       rw->Count = n;
       rp->Status |= STDON;
       break;
@@ -238,6 +297,10 @@ void __cdecl rt_strategy(RPH FAR *rp)
 
    case CMD_CLOSE:
    default:
+      rd_close(((RP_OPENCLOSE FAR *)rp)->sfn);
+      rp->Status |= STDON;
+      break;
+
       rp->Status |= STDON;
       break;
    }

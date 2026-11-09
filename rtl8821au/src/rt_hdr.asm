@@ -29,8 +29,9 @@ ATTR_CHAR       equ 0x8000
 ATTR_IDC        equ 0x4000
 ATTR_OPENCLOSE  equ 0x0800
 ATTR_LEVEL3     equ 0x0180
-; capabilities strip: bit 4 = the INIT COMPLETE command (1Fh) is supported
-CAP_INITCOMPLETE equ 0x00000010
+; capabilities strip: bit 0 = DosDevIOCtl2 and SHUTDOWN, bit 4 = INIT COMPLETE (1Fh)
+CAP_IOCTL2_SHUTDOWN equ 0x00000001
+CAP_INITCOMPLETE     equ 0x00000010
 
 extern _rt_strategy                             ; C: void __cdecl rt_strategy(RPH far *rp)
 extern _rt_idc                                  ; C: void __far __cdecl rt_idc(RP_GENIOCTL far *rp)
@@ -45,7 +46,7 @@ rt_head:
         db      'WRND32$ '                      ; 8-byte device name: the GenMAC wrapper name the OS/2
                                                 ; wpa_supplicant looks for
         times 8 db 0                            ; reserved
-        dd      CAP_INITCOMPLETE                ; capabilities bit strip
+        dd      CAP_IOCTL2_SHUTDOWN | CAP_INITCOMPLETE ; capabilities bit strip
 
 segment _DATA
 global _rt_devhelp

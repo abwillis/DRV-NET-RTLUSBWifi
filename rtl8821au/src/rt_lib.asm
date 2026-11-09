@@ -268,6 +268,35 @@ _rt_dh_phys_to_gdt:
         pop     bp
         ret
 
+; USHORT rt_dh_phys_to_gdt_sel(ULONG phys, USHORT len, USHORT sel, UCHAR access)
+;   PDD "PhysToGDTSel" (54h): EAX = physical address, ECX = length, SI = selector, DH = access.
+;   This variant is required for a writable mapping (GDTSEL_R0DATA = 6).
+global _rt_dh_phys_to_gdt_sel
+_rt_dh_phys_to_gdt_sel:
+        push    bp
+        mov     bp, sp
+        push    si
+        push    di
+        mov     eax, [bp+4]
+        xor     ecx, ecx
+        mov     cx, [bp+8]
+        mov     si, [bp+10]
+        mov     dh, [bp+12]
+        mov     dl, 0x54
+        call    far [_rt_devhelp]
+        jc      .bad
+        xor     ax, ax
+        jmp     short .out
+.bad:
+        or      ax, ax
+        jnz     .out
+        mov     ax, 1
+.out:
+        pop     di
+        pop     si
+        pop     bp
+        ret
+
 ; USHORT rt_dh_virt_to_phys(void far *p, ULONG *phys)              PDD "VirtToPhys" (16h)
 ;   DS:SI = virtual address; returns AX:BX = physical address (high:low). DS is replaced by the call, so the
 ;   DevHelp entry point is copied to the stack first.

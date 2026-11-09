@@ -96,8 +96,12 @@ static USHORT g_scanning;          /* a scan is sweeping the channels (holds g_n
 
 static void nic_lock(void)
 {
-   while (rt_tas(&g_nic_busy))
-      rt_dh_procblock(NIC_EVENT, 50L, 0);              /* short: a ProcRun between the failed attempt and the block is lost */
+   rt_cli();
+   while (rt_tas(&g_nic_busy)) {
+      rt_dh_procblock(NIC_EVENT, 50L, WAIT_UNINTERRUPTIBLE);
+      rt_cli();                                      /* re-disable before re-testing the condition */
+   }
+   rt_sti();
 }
 
 static void nic_unlock(void)
@@ -615,7 +619,7 @@ void rtl8188eu_genmac_ioctl(RP_GENIOCTL FAR *rp)
    }
 
    par = (ULONG FAR *)rp->ParmPacket;
-   if (par == 0 || rp->ParmLen < 12 ||
+   if (par == 0 || (rp->ParmLen != 0 && rp->ParmLen < 12) ||
        rt_dh_verify(SELECTOROF(rp->ParmPacket), 12, OFFSETOF(rp->ParmPacket), VERIFY_READWRITE)) {
       rp->rph.Status |= STDON | STERR | ERROR_I24_GEN_FAILURE;
       return;
@@ -657,6 +661,7 @@ void rtl8188eu_genmac_ioctl(RP_GENIOCTL FAR *rp)
 #if RT_TX_RECLAIM
       usb_tx_reclaim();                         /* task time: cancel transmit requests the dongle never completed */
 #endif
+      usb_rx_recover(&g_usbdev);                /* restart a receive engine stopped by errors or a failed resubmit */
       rtl8188eu_led_tick(&g_usbdev);
    }
    if (!fast && g_pj && g_hw_ready && !g_scanning && (long)(rtl8188eu_ms() - g_pj_due) >= 0L) {
