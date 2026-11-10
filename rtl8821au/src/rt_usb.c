@@ -203,6 +203,7 @@ static USHORT xfer_wait(ULONG timeout)
 {
    USHORT done;
    ULONG  start = rtl8188eu_ms(), spent;
+   USHORT tries = 0;
 
    /* DDK ProcBlock remarks: always re-check the condition after a wakeup; a wakeup is not proof of completion.
     * Loop until done or the full timeout has elapsed. Uninterruptible: a transfer is short, and abandoning one
@@ -213,6 +214,11 @@ static USHORT xfer_wait(ULONG timeout)
       if (spent >= timeout)
          break;
       rt_dh_procblock(EVT_XFER, timeout - spent, WAIT_UNINTERRUPTIBLE);
+      spent = start ? (rtl8188eu_ms() - start) : timeout;   /* no clock: one full-length block only */
+      if ((spent >= timeout && tries) || tries > 16)       /* bounded even if the clock is stuck */
+         break;
+      tries++;
+      rt_dh_procblock(EVT_XFER, spent < timeout ? timeout - spent : timeout, WAIT_UNINTERRUPTIBLE);
       rt_cli();
    }
    done = g_xfer.done;
