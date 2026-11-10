@@ -296,11 +296,11 @@ void __cdecl rt_strategy(RPH FAR *rp)
       break;
 
    case CMD_CLOSE:
-   default:
       rd_close(((RP_OPENCLOSE FAR *)rp)->sfn);
       rp->Status |= STDON;
       break;
 
+   default:
       rp->Status |= STDON;
       break;
    }
