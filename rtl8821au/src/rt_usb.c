@@ -202,11 +202,19 @@ USHORT g_u_acc, g_u_done, g_u_stat, g_u_wait;     /* debug: last synchronous req
 static USHORT xfer_wait(ULONG timeout)
 {
    USHORT done;
+   ULONG  start = rtl8188eu_ms(), spent;
 
+   /* DDK ProcBlock remarks: always re-check the condition after a wakeup; a wakeup is not proof of completion.
+    * Loop until done or the full timeout has elapsed. Uninterruptible: a transfer is short, and abandoning one
+    * midway through a join leaves the chip half-programmed. */
    rt_cli();
-   if (!g_xfer.done)
-      rt_dh_procblock(EVT_XFER, timeout, WAIT_INTERRUPTIBLE);
-   rt_cli();
+   while (!g_xfer.done) {
+      spent = rtl8188eu_ms() - start;
+      if (spent >= timeout)
+         break;
+      rt_dh_procblock(EVT_XFER, timeout - spent, WAIT_UNINTERRUPTIBLE);
+      rt_cli();
+   }
    done = g_xfer.done;
    rt_sti();
    return done;
@@ -665,6 +673,12 @@ int usb_rx_start(usb_dev_t *dev, UCHAR ep)
    g_rx_run = 1;
    for (i = 0; i < RXN; i++)
       if (rx_submit(dev, ep, i) != 0) {
+         /* Requests 0..i-1 are already queued: cancel them so a later usb_rx_recover() does not stack a second
+          * set on top of them and drain the request pool that the transmit path also needs. */
+         g_cancel.controllerId  = dev->ctrlId;
+         g_cancel.deviceAddress = dev->devAddr;
+         g_cancel.endPointId    = ep;
+         usbd_call(USB_IDC_FUNCTION_CANCEL, (PVOID)&g_cancel);
          g_rx_run = 0;
          return -1;
       }
@@ -679,9 +693,13 @@ void usb_rx_stop(void)
 int usb_rx_recover(usb_dev_t *dev)
 {
    UCHAR ep;
+   static ULONG last;
 
    if (!dev->attached || g_rx_run)
       return 0;
+   if ((long)(rtl8188eu_ms() - last) < 1000L)   /* at most one attempt per second, not one per monitor poll */
+      return -1;
+   last = rtl8188eu_ms();
    ep = g_rx_ep;
    if (ep == 0)
       return -1;
