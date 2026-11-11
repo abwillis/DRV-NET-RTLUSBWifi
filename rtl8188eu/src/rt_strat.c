@@ -93,7 +93,7 @@ static void rd_close(USHORT sfn)
  *   /W  wait:    pause 30 s after all drivers are loaded so the messages can be read
  *   /AA beeps:   accepted (the driver never beeps)
  * Text goes through Save_Message (message 1178 = "%1"); the strings must be static. */
-#define DRV_VERSION   "0.1.4a3"
+#define DRV_VERSION   "0.1.4a4"
 #define MSG_REPLACEMENT_STRING  1178
 static struct {
    USHORT id;
@@ -170,9 +170,8 @@ static void rt_init(RP_INIT FAR *rp)
    /* Attach to the USB stack to obtain its IDC entry point. */
    rc = rt_dh_attach_dd(usbd, idc);
    if (rc) {
-      say("RTL88EU: could not be loaded. USB stack (USBD$) not found - load the USB drivers before it.");
-      rp->p1.End.CodeEnd = 0;                 /* failed INIT: Pointer_1 = 0000:0000 (PDD INIT remarks) */
-      rp->p1.End.DataEnd = 0;
+      say("RTL88EU: could not be loaded: USB stack (USBD$) not found.");
+      say("RTL88EU: load the USB drivers before it.");
       rp->rph.Status |= STDON | STERR | ERROR_I24_GEN_FAILURE;
       return;
    }
@@ -193,11 +192,15 @@ static void rt_init(RP_INIT FAR *rp)
       if (g_opt_v) {
          say("RTL88EU: Realtek RTL8188EU (0BDA:8179) USB WLAN driver for OS/2.");
          say("RTL88EU: Version " DRV_VERSION "  Date " __DATE__ ".");
-         say("RTL88EU: Supported device: Realtek 802.11n NIC 0BDA:8179, found when it is plugged in.");
-         if (nrc == 0)
-            say("RTL88EU: NDIS MAC registered with the Protocol Manager (adapter lan, GenMAC device WRND32$).");
-         else
-            say("RTL88EU: NDIS MAC not registered (no [RTL88EU_NIF] in PROTOCOL.INI?); GenMAC device WRND32$ only.");
+         say("RTL88EU: Supported device: Realtek 802.11n NIC 0BDA:8179.");
+         say("RTL88EU: It is found when it is plugged in.");
+         if (nrc == 0) {
+            say("RTL88EU: NDIS MAC registered with the Protocol Manager (adapter lan).");
+            say("RTL88EU: GenMAC device: WRND32$.");
+         } else {
+            say("RTL88EU: NDIS MAC not registered (no [RTL88EU_NIF] in PROTOCOL.INI?).");
+            say("RTL88EU: GenMAC device WRND32$ only.");
+         }
          {
             static char lanmsg[] = "RTL88EU: TCP/IP interface: lan0.";
 
@@ -207,8 +210,11 @@ static void rt_init(RP_INIT FAR *rp)
          say("RTL88EU: Driver loaded without warnings.");
       }
    }
-   if (g_opt_w)
-      say("RTL88EU: Realtek RTL8188EU USB WLAN driver " DRV_VERSION ". The boot pauses 30 seconds after all drivers are loaded so the messages can be read.");
+   if (g_opt_w) {
+      say("RTL88EU: Realtek RTL8188EU USB WLAN driver " DRV_VERSION ".");
+      say("RTL88EU: The boot pauses 30 seconds after all drivers are loaded");
+      say("RTL88EU: so the messages can be read.");
+   }
    if (dhcp_init() != 0 || dbg_init() != 0)      /* mapping calls also reject a missing selector */
       say("RTL88EU: warning - GDT selector allocation failed; the text READ/WRITE channel is disabled.");
 

@@ -273,7 +273,7 @@ static USHORT g_dg_inf[8];                         /* ... and prevpl, prevtot, o
 UCHAR  g_joined, g_jch, g_jslen;
 UCHAR  g_jbssid[6], g_jssid[33];
 USHORT g_jrescap, g_jstatus, g_jaidv;
-UCHAR  g_jreq[96], g_jres[128];
+UCHAR  g_jreq[160], g_jres[192];
 USHORT g_jreqlen, g_jreslen;
 
 /* Received EAPOL frames (as Ethernet frames), waiting for the supplicant. */
@@ -346,6 +346,59 @@ static UCHAR  g_rxsw;
  * make the TCP receiver send duplicate ACKs, and the sender takes them for loss and slows down. One cache entry per
  * traffic identifier (QoS TID 0..15, 16 = non-QoS). */
 static USHORT g_sc[17];
+
+/* Block Ack receive (R21_BA). With an agreement for a traffic identifier the access point sends A-MPDUs: several frames
+ * per channel access, one Block Ack for all of them (the chip sends it). A frame lost in a burst is resent in a later
+ * one, after frames that follow it, so frames of that TID can arrive out of order. There is no reorder buffer: frames
+ * go up as they arrive (TCP puts segments back in order), and the duplicate filter remembers the last BA_SEEN sequence
+ * numbers of the TID instead of only the last one. Counters for the read-out: frames of an agreement TID, frames that
+ * came after a later one (out of order), sequence gaps, duplicates caught by the window, agreements ended by the AP. */
+#define BA_SEEN 16                                  /* a power of two, at least the window size */
+static UCHAR  g_ba_on;                              /* bit n: an agreement for TID n is active */
+static USHORT g_ba_seen[8][BA_SEEN];
+static UCHAR  g_ba_seen_i[8];
+static USHORT g_ba_last[8];                         /* newest sequence number seen per TID */
+USHORT        g_ba_rx, g_ba_ooo, g_ba_gap, g_ba_dupw, g_ba_del;
+
+static void ba_start(UCHAR tid, USHORT ssn)        /* a new agreement: frames start at sequence number ssn */
+{
+   USHORT q;
+
+   for (q = 0; q < BA_SEEN; q++)
+      g_ba_seen[tid][q] = 0xFFFF;
+   g_ba_seen_i[tid] = 0;
+   g_ba_last[tid] = (USHORT)((ssn - 1) & 0x0FFF);
+   g_ba_on = (UCHAR)(g_ba_on | (1 << tid));
+}
+
+/* Duplicate filter and ordering counters for a TID with an agreement. 1 = a copy of a frame we already have. */
+static int ba_dup(UCHAR tid, USHORT sc, UCHAR retry)
+{
+   USHORT seq = (USHORT)(sc >> 4), q, d;
+
+   g_ba_rx++;
+   if (retry)
+      for (q = 0; q < BA_SEEN; q++)
+         if (g_ba_seen[tid][q] == seq) {
+            g_ba_dupw++;
+            return 1;
+         }
+   g_ba_seen[tid][g_ba_seen_i[tid]] = seq;
+   g_ba_seen_i[tid] = (UCHAR)((g_ba_seen_i[tid] + 1) & (BA_SEEN - 1));
+   d = (USHORT)((seq - g_ba_last[tid]) & 0x0FFF);
+   if (d != 0 && d < 2048) {                       /* newer than everything so far */
+      if (d > 1)
+         g_ba_gap++;                               /* one or more frames skipped (they may still come) */
+      g_ba_last[tid] = seq;
+   } else if (d != 0)
+      g_ba_ooo++;                                  /* older than one already delivered: out of order */
+   return 0;
+}
+
+UCHAR rtl8188eu_ba_on(void)
+{
+   return g_ba_on;
+}
 static USHORT g_ndup;
 static ULONG  g_icmp_t0;                            /* ms clock when the last ICMP echo request reached the protocol stack */
 static USHORT g_ntx_call, g_ntx_ok, g_ntx_nokey, g_ntx_noslot;
@@ -357,56 +410,30 @@ UCHAR         g_open;                           /* joined an unencrypted (open) 
 UCHAR         g_want_open;                      /* the next join is for an open network (set from the authentication / encryption modes) */
 static UCHAR  g_ptk_ok, g_gtk_ok;                    /* pairwise / group key installed on the current join */
 
-static void rx_data_frame(UCHAR *f, USHORT len)
+/* A-MSDU receive (802.11n makes it mandatory once we advertise HT; Max A-MSDU length 3839 in our HT capabilities).
+ * Counters for the read-out: frames, subframes delivered, frames dropped as malformed or unsafe. */
+USHORT g_amsdu_n, g_amsdu_sub, g_amsdu_bad;
+
+/* One MSDU to the protocol stack, or to the EAPOL / early queue. da, sa: its Ethernet addresses; llc: its LLC/SNAP
+ * header; ll: bytes from there to the end of the MSDU; prot: the 802.11 frame carrying it was protected. */
+static void rx_msdu(UCHAR *da, UCHAR *sa, UCHAR *llc, USHORT ll, UCHAR prot)
 {
    static USHORT nh;                              /* static: its address is passed to ndis_rx_get (SS != DS) */
-   USHORT hl, i, pl, tail = 0, n;
+   USHORT i, pl, n;
    int    nd = 0;
    UCHAR  *d, *src;
    UCHAR  eapol;
 
-   g_led_act = 1;
-   if (f[0] & 0x40)                               /* null / no-data subtypes */
+   if (ll < 8)
       return;
-   for (i = 0; i < 6; i++)
-      if (f[10 + i] != g_jbssid[i])
-         return;
-   if ((f[4] & 1) == 0)                           /* unicast: must be to us  */
-      for (i = 0; i < 6; i++)
-         if (f[4 + i] != g_mymac[i])
-            return;
-   {
-      USHORT sc  = (USHORT)(f[22] | (f[23] << 8));
-      UCHAR  tid = (UCHAR)((f[0] & 0x80) ? (f[24] & 0x0F) : 16);
-
-      if ((f[1] & 0x08) && g_sc[tid] == sc) {     /* retransmission of the frame we already have */
-         g_ndup++;
-         return;
-      }
-      g_sc[tid] = sc;
-   }
-   g_nd++;
-   if (f[1] & 0x40) { g_np++; if (g_rxsw) g_nsw++; }
-   hl = (USHORT)((f[0] & 0x80) ? 26 : 24);
-   if ((f[1] & 0x40) && g_open) {                 /* an open network must not send protected frames */
-      g_ndrop++;
+   if (llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03 || llc[3] || llc[4] || llc[5])
       return;
-   }
-   if (f[1] & 0x40) {                             /* protected: CCMP header + MIC */
-      if (g_rxsw) { g_ndrop++; return; }          /* chip did not decrypt: no key */
-      hl = (USHORT)(hl + 8);
-      tail = 0;                                   /* chip already strips the MIC: IP length matches exactly without trimming */
-   }
-   if ((USHORT)(hl + 8 + tail) > len)
-      return;
-   if (f[hl] != 0xAA || f[hl + 1] != 0xAA || f[hl + 2] != 0x03 || f[hl + 3] || f[hl + 4] || f[hl + 5])
-      return;
-   pl = (USHORT)(len - tail - hl - 8);            /* payload after the SNAP header */
-   src = f + hl + 8;
-   eapol = (UCHAR)(f[hl + 6] == 0x88 && f[hl + 7] == 0x8E);
+   pl = (USHORT)(ll - 8);                         /* payload after the SNAP header */
+   src = llc + 8;
+   eapol = (UCHAR)(llc[6] == 0x88 && llc[7] == 0x8E);
    /* WPA2 rule: only EAPOL may travel unprotected. Every other data frame needs the pairwise key to be
     * installed AND the Protected bit set; otherwise anyone who spoofs the AP address could inject plaintext. */
-   if (!eapol && !g_open && (!g_ptk_ok || !(f[1] & 0x40))) {      /* (an open join accepts plain data: there is no key to wait for) */
+   if (!eapol && !g_open && (!g_ptk_ok || !prot)) {   /* (an open join accepts plain data: there is no key to wait for) */
       g_ndrop++;
       return;
    }
@@ -427,8 +454,8 @@ static void rx_data_frame(UCHAR *f, USHORT len)
       if (g_dqn >= DQN || n > DQSZ) { g_ndrop++; return; }
       d = g_dq[g_dqt];
    }
-   for (i = 0; i < 6; i++) { d[i] = f[4 + i]; d[6 + i] = f[16 + i]; }   /* DA, SA */
-   d[12] = f[hl + 6]; d[13] = f[hl + 7];
+   for (i = 0; i < 6; i++) { d[i] = da[i]; d[6 + i] = sa[i]; }   /* DA, SA */
+   d[12] = llc[6]; d[13] = llc[7];
    for (i = 0; i < pl; i++) d[14 + i] = src[i];
    if (eapol) {
       g_eqlen[g_eqt] = n;
@@ -448,6 +475,104 @@ static void rx_data_frame(UCHAR *f, USHORT len)
       g_dqn++;
    }
 }
+
+/* A-MSDU body (802.11-2016 9.3.2.2.2): subframes of DA (6), SA (6), length (2, big endian), then that many bytes of
+ * MSDU (LLC/SNAP + payload), each padded to a multiple of 4 except the last. Accepted only in protected frames (or on
+ * an open network, where nothing is protected), and a
+ * first subframe whose DA reads as an LLC/SNAP header is dropped: that is a normal frame with the A-MSDU bit flipped
+ * by an attacker (FragAttacks, CVE-2020-24588; the mitigation Linux mac80211 uses). */
+static void rx_amsdu(UCHAR *p, USHORT n, UCHAR prot)
+{
+   USHORT off = 0, sl, tot;
+
+   g_amsdu_n++;
+   if ((!prot && !g_open) || n < 14 ||
+       (p[0] == 0xAA && p[1] == 0xAA && p[2] == 0x03 && p[3] == 0 && p[4] == 0 && p[5] == 0)) {
+      g_amsdu_bad++;
+      return;
+   }
+   while ((USHORT)(off + 14) <= n) {
+      sl = (USHORT)((p[off + 12] << 8) | p[off + 13]);
+      if ((USHORT)(off + 14 + sl) > n) {
+         g_amsdu_bad++;                           /* truncated subframe: drop the rest */
+         return;
+      }
+      rx_msdu(p + off, p + off + 6, p + off + 14, sl, prot);
+      g_amsdu_sub++;
+      tot = (USHORT)(14 + sl);
+      off = (USHORT)(off + ((tot + 3) & 0xFFFC));
+   }
+}
+
+static void rx_data_frame(UCHAR *f, USHORT len)
+{
+   USHORT hl, i, tail = 0;
+   UCHAR  prot;
+
+   g_led_act = 1;
+   if (f[0] & 0x40)                               /* null / no-data subtypes */
+      return;
+   for (i = 0; i < 6; i++)
+      if (f[10 + i] != g_jbssid[i])
+         return;
+   if ((f[4] & 1) == 0)                           /* unicast: must be to us  */
+      for (i = 0; i < 6; i++)
+         if (f[4 + i] != g_mymac[i])
+            return;
+   {
+      USHORT sc  = (USHORT)(f[22] | (f[23] << 8));
+      UCHAR  tid = (UCHAR)((f[0] & 0x80) ? (f[24] & 0x0F) : 16);
+
+      if (tid < 8 && (g_ba_on & (1 << tid))) {   /* Block Ack agreement: frames may come out of order */
+         if (ba_dup(tid, sc, (UCHAR)(f[1] & 0x08))) {
+            g_ndup++;
+            return;
+         }
+      } else {
+         if ((f[1] & 0x08) && g_sc[tid] == sc) {  /* retransmission of the frame we already have */
+            g_ndup++;
+            return;
+         }
+         g_sc[tid] = sc;
+      }
+   }
+   g_nd++;
+   prot = (UCHAR)((f[1] & 0x40) ? 1 : 0);
+   if (prot) { g_np++; if (g_rxsw) g_nsw++; }
+   hl = (USHORT)((f[0] & 0x80) ? 26 : 24);
+   if (prot && g_open) {                          /* an open network must not send protected frames */
+      g_ndrop++;
+      return;
+   }
+   if ((f[0] & 0x80) && (f[1] & 0x80))            /* QoS data with the Order bit: a 4-byte HT Control field follows */
+      hl = (USHORT)(hl + 4);
+   if (prot) {                                    /* protected: CCMP header + MIC */
+      if (g_rxsw) { g_ndrop++; return; }          /* chip did not decrypt: no key */
+      hl = (USHORT)(hl + 8);
+      tail = 0;                                   /* chip already strips the MIC: IP length matches exactly without trimming */
+   }
+   if ((USHORT)(hl + 8 + tail) > len)
+      return;
+   if ((f[0] & 0x80) && (f[24] & 0x80)) {         /* QoS control bit 7: the body is an A-MSDU */
+      rx_amsdu(f + hl, (USHORT)(len - tail - hl), prot);
+      return;
+   }
+   rx_msdu(f + 4, f + 16, f + hl, (USHORT)(len - tail - hl), prot);
+}
+
+/* Block Ack (ADDBA) requests from the access point. Once we join as an HT client the access point may ask to set up a
+ * Block Ack agreement for A-MPDU aggregation. With R21_BA the request is accepted and the access point sends A-MPDUs
+ * (frames go up as they arrive, see ba_dup); without it, the request is declined (status 37) and the access point sends
+ * single frames, at HT rates. Latest request only; g_ba_req / g_ba_tx count requests seen and answers sent. */
+static volatile UCHAR g_ba_pend;
+static UCHAR  g_ba_acc;                          /* the pending answer accepts (1) or declines (0) */
+UCHAR         g_r21_ba = R21_BA;                 /* 1 = accept Block Ack agreements (A-MPDU receive), 0 = decline */
+static UCHAR  g_ba_tok, g_ba_par[2], g_ba_tmo[2];
+static ULONG  g_ba_t0;                           /* ms clock when the pending request arrived */
+UCHAR         g_ba_tid = 0xFF;
+USHORT        g_ba_req, g_ba_tx, g_ba_fail;
+USHORT        g_ba_fast;                         /* of g_ba_tx: sent from the context hook (the rest: the 1 s tick) */
+USHORT        g_ba_ms;                           /* request -> decline queued, the last one, ms */
 
 /* One management frame (beacon 0x80 / probe response 0x50): record the network. */
 static int ssid_match(net_t *nt);
@@ -519,6 +644,32 @@ static void note_frame(UCHAR *f, USHORT len, signed char rssi)
                   g_jres[g_jreslen + m] = f[q + m];
                g_jreslen = (USHORT)(g_jreslen + 2 + f[q + 1]);
             }
+         } else if (sub == 0xD0 && len >= 33 && f[24] == 3 && f[25] == 0) {
+            /* action, Block Ack category, ADDBA request: dialog token, BA parameter set, timeout, start sequence.
+             * Accepted (R21_BA) or declined; the answer goes out from the context hook (rtl8188eu_ba_hook), since this
+             * runs in the receive path, which must not block on a USB transfer. Nothing in the chip needs setting up for
+             * an agreement: it sends the Block Acks itself (Realtek's issue_addba_rsp programs no register either). */
+            g_ba_req++;
+            g_ba_tok = f[26];
+            g_ba_par[0] = f[27]; g_ba_par[1] = f[28];
+            g_ba_tmo[0] = f[29]; g_ba_tmo[1] = f[30];
+            g_ba_tid = (UCHAR)((f[27] >> 2) & 0x0F);
+            g_ba_t0 = rtl8188eu_ms();
+            g_ba_acc = (UCHAR)(g_r21_ba && g_ba_tid < 8);
+            if (g_ba_acc)                       /* the access point starts sending A-MPDUs once it has our answer */
+               ba_start(g_ba_tid, (USHORT)((f[31] | (f[32] << 8)) >> 4));
+            g_ba_pend = 1;
+            ndis_kick();                         /* answer within milliseconds: the access point may hold this
+                                                  * traffic identifier's frames until it has our answer */
+         } else if (sub == 0xD0 && len >= 30 && f[24] == 3 && f[25] == 2) {
+            /* DELBA: the agreement for a TID ends (parameter set bits 15:12 = TID) */
+            UCHAR dt = (UCHAR)(f[27] >> 4);
+
+            if (dt < 8) {
+               g_ba_on = (UCHAR)(g_ba_on & ~(1 << dt));
+               g_sc[dt] = 0xFFFF;
+            }
+            g_ba_del++;
          } else if (sub == 0xC0 || sub == 0xA0) {
             USHORT why = (USHORT)(f[24] | (f[25] << 8));
 
@@ -1197,12 +1348,119 @@ static int tx_deauth(usb_dev_t *dev, UCHAR *bssid)
    return tx_mgmt(dev, f, 26, 0);
 }
 
+/* ADDBA response (category 3 Block Ack, action 1): dialog token, status, BA parameter set, timeout. Declined: status 37
+ * with the request's parameters echoed. Accepted: status 0; the parameter set keeps the request's policy and TID, clears
+ * A-MSDU-in-A-MPDU (bit 0), and sets the buffer size (bits 15:6) to the request's, at most R21_BA_WIN (0 in the request
+ * means "any"). Built into f (33 bytes). */
+static void addba_decline_build(UCHAR *f)
+{
+   USHORT i, par = (USHORT)(g_ba_par[0] | (g_ba_par[1] << 8)), win;
+
+   for (i = 0; i < 33; i++) f[i] = 0;
+   mgmt_hdr(f, 0xD0, g_jbssid);
+   f[24] = 3;                                     /* category: Block Ack   */
+   f[25] = 1;                                     /* ADDBA response        */
+   f[26] = g_ba_tok;
+   if (g_ba_acc) {
+      win = (USHORT)(par >> 6);
+      if (win == 0 || win > R21_BA_WIN)
+         win = R21_BA_WIN;
+      par = (USHORT)((par & 0x003E) | (win << 6));
+      f[27] = 0;   f[28] = 0;                     /* status: success */
+   } else {
+      f[27] = 37;  f[28] = 0;                     /* status: request declined */
+   }
+   f[29] = (UCHAR)(par & 0xFF); f[30] = (UCHAR)(par >> 8);
+   f[31] = g_ba_tmo[0]; f[32] = g_ba_tmo[1];
+}
+
+/* The normal path: from the NDIS context hook (rt_ndis.c), armed by the receive path when the request arrives. Task
+ * time, where the protocol stack's own transmits already run; never blocks: one asynchronous TX slot on the management
+ * endpoint, freed by its completion. With no free slot the request stays pending for the next hook run or the tick. */
+void rtl8188eu_ba_hook(void)
+{
+   static UCHAR f[36];
+   USHORT slot, i;
+   UCHAR *b;
+
+   if (!g_ba_pend || !g_joined || !g_hw_ready)
+      return;
+   slot = usb_tx_alloc();
+   if (slot == 0xFFFF)
+      return;
+   g_ba_pend = 0;
+   addba_decline_build(f);
+   b = usb_tx_buf(slot);
+   for (i = 0; i < 33; i++)
+      b[TXD_LEN + i] = f[i];
+   txd_fill(b, 33, 0, 0, 0, g_mgmtrate);
+   if (usb_tx_submit(&g_usbdev, TXEP_MGT, slot, (USHORT)(TXD_LEN + 33)) == 0) {
+      g_ba_tx++;
+      g_ba_fast++;
+      g_ba_ms = (USHORT)(rtl8188eu_ms() - g_ba_t0);
+   } else {
+      g_ba_pend = 1;                              /* the slot is released on failure: try again later */
+      g_ba_fail++;
+   }
+}
+
+/* What the access point's association response granted, from its elements (g_jres): bit 0 HT capabilities, bit 1 HT
+ * operation, bit 2 WMM parameter element. 0 when not joined. */
+UCHAR rtl8188eu_ht_state(void)
+{
+   USHORT q;
+   UCHAR  r = 0;
+
+   if (!g_joined)
+      return 0;
+   for (q = 0; (USHORT)(q + 2) <= g_jreslen && (USHORT)(q + 2 + g_jres[q + 1]) <= g_jreslen; q = (USHORT)(q + 2 + g_jres[q + 1])) {
+      if (g_jres[q] == 45) r |= 1;
+      if (g_jres[q] == 61) r |= 2;
+      if (g_jres[q] == 0xDD && g_jres[q + 1] >= 6 && g_jres[q + 2] == 0x00 && g_jres[q + 3] == 0x50 &&
+          g_jres[q + 4] == 0xF2 && g_jres[q + 5] == 0x02 && g_jres[q + 6] == 0x01)
+         r |= 4;
+   }
+   return r;
+}
+
+/* Fallback (no context hook, or every slot was busy): task time, under the request lock, about once a second
+ * (rtl_nic.c), through the join's synchronous management path. */
+void rtl8188eu_ba_tick(usb_dev_t *dev)
+{
+   static UCHAR f[36];
+
+   if (!g_ba_pend)
+      return;
+   g_ba_pend = 0;
+   if (!g_joined)
+      return;
+   addba_decline_build(f);
+   if (tx_mgmt(dev, f, 33, 0) == 0) {
+      g_ba_tx++;
+      g_ba_ms = (USHORT)(rtl8188eu_ms() - g_ba_t0);
+   } else
+      g_ba_fail++;
+}
+
+/* HT capabilities element (802.11-2016 9.4.2.56) for one stream at 20 MHz:
+ *   HT capability information 0x002C: SM power save disabled (bits 3:2 = 3), short GI at 20 MHz (bit 5); no 40 MHz,
+ *     no LDPC, no STBC, no Greenfield, maximum A-MSDU 3839 bytes (rx_amsdu handles those)
+ *   A-MPDU parameters R21_AMPDU_PARAM: maximum A-MPDU length (bits 1:0, 8 KB << n) and minimum spacing (bits 4:2)
+ *   supported MCS set: receive MCS 0-7, transmit MCS set defined and equal to the receive set
+ * and the WMM information element (Wi-Fi WMM spec 2.2.1: OUI 00:50:F2, type 2, subtype 0, version 1, QoS info 0, no
+ * U-APSD). Access points only use HT rates towards a QoS client, so the two go together. R21_HT 0 leaves both out. */
+static UCHAR g_htcap[28] = { 45, 26, 0x2C, 0x00, R21_AMPDU_PARAM,
+                             0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0 };
+static UCHAR g_wmmie[9]  = { 0xDD, 7, 0x00, 0x50, 0xF2, 0x02, 0x00, 0x01, 0x00 };
+UCHAR        g_r21_ht = R21_HT;
+
 static int tx_assoc(usb_dev_t *dev, UCHAR *bssid, char *ssid, UCHAR slen)
 {
-   static UCHAR f[112];
+   static UCHAR f[160];
    USHORT i, n;
 
-   for (i = 0; i < 112; i++) f[i] = 0;
+   for (i = 0; i < 160; i++) f[i] = 0;
    mgmt_hdr(f, 0x00, bssid);                      /* association request */
    n = 24;
    f[n++] = (UCHAR)(g_want_open ? 0x21 : 0x31); f[n++] = 0x16;   /* capability: ESS, [privacy], short preamble/slot */
@@ -1215,6 +1473,10 @@ static int tx_assoc(usb_dev_t *dev, UCHAR *bssid, char *ssid, UCHAR slen)
    for (i = 0; i < 4; i++) f[n++] = g_rt4[i];     /* extended rates */
    if (!g_want_open)
       for (i = 0; i < 22; i++) f[n++] = g_rsn[i]; /* RSN: CCMP, CCMP, PSK (none for an open network) */
+   if (g_r21_ht) {
+      for (i = 0; i < 28; i++) f[n++] = g_htcap[i];   /* HT capabilities (element order: after RSN) */
+      for (i = 0; i < 9; i++)  f[n++] = g_wmmie[i];   /* WMM information (vendor specific: last)  */
+   }
    g_jreqlen = (USHORT)(n - 28);                  /* what the supplicant reads back as request IEs */
    for (i = 0; i < g_jreqlen; i++) g_jreq[i] = f[28 + i];
    return tx_mgmt(dev, f, n, 0);
@@ -1317,6 +1579,8 @@ int rtl8188eu_join(usb_dev_t *dev, UCHAR *want_bssid)
    rtl8821_set_channel(dev, g_net[best].ch);
    g_curch = g_net[best].ch;
    rtl8821_iqk(dev, g_net[best].ch);                  /* firmware IQ calibration on the access point's channel */
+   g_ba_pend = 0;                                     /* a Block Ack request from an earlier join is void */
+   g_ba_on = 0;                                       /* and so are its agreements */
 #if RUN_TXPOWER
    rtl8188eu_set_txpower(dev, g_net[best].ch);        /* per-rate power for this channel */
 #endif
@@ -1374,6 +1638,9 @@ int rtl8188eu_join(usb_dev_t *dev, UCHAR *want_bssid)
    g_joined  = 1;
    g_open = g_want_open;
    keys_reset(dev, (UCHAR)(g_open ? 0 : 1));      /* empty CAM, security on (no keys yet) - off for an open network */
+   if (g_ba_pend)
+      ndis_kick();                                /* an ADDBA request that came with the association response: answer it
+                                                   * now, not after the 4-way handshake (it may hold the EAPOL frames) */
    tcom_str(" OK aid="); tcom_dec(g_aid); tcom(10);
    return 0;
 }

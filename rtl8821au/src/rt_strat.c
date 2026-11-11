@@ -171,7 +171,8 @@ static void rt_init(RP_INIT FAR *rp)
    /* Attach to the USB stack to obtain its IDC entry point. */
    rc = rt_dh_attach_dd(usbd, idc);
    if (rc) {
-      say("RTL8821AU: could not be loaded. USB stack (USBD$) not found - load the USB drivers before it.");
+      say("RTL8821AU: could not be loaded: USB stack (USBD$) not found.");
+      say("RTL8821AU: load the USB drivers before it.");
       rp->p1.End.CodeEnd = 0;                 /* failed INIT: Pointer_1 = 0000:0000 (PDD INIT remarks) */
       rp->p1.End.DataEnd = 0;
       rp->rph.Status |= STDON | STERR | ERROR_I24_GEN_FAILURE;
@@ -197,11 +198,15 @@ static void rt_init(RP_INIT FAR *rp)
       if (g_opt_v) {
          say("RTL8821AU: Realtek RTL8811AU/8821AU (2357:011E) USB WLAN driver for OS/2.");
          say("RTL8821AU: Version " DRV_VERSION "  Build " DRV_BUILD "  Date " __DATE__ " " __TIME__ ".");
-         say("RTL8821AU: Supported device: TP-Link Archer T2U Nano 2357:011E, found when it is plugged in.");
-         if (nrc == 0)
-            say("RTL8821AU: NDIS MAC registered with the Protocol Manager (adapter lan, GenMAC device WRND32$).");
-         else
-            say("RTL8821AU: NDIS MAC not registered (no [RTL88EU_NIF] in PROTOCOL.INI?); GenMAC device WRND32$ only.");
+         say("RTL8821AU: Supported device: TP-Link Archer T2U Nano 2357:011E.");
+         say("RTL8821AU: It is found when it is plugged in.");
+         if (nrc == 0) {
+            say("RTL8821AU: NDIS MAC registered with the Protocol Manager (adapter lan).");
+            say("RTL8821AU: GenMAC device: WRND32$.");
+         } else {
+            say("RTL8821AU: NDIS MAC not registered (no [RTL88EU_NIF] in PROTOCOL.INI?).");
+            say("RTL8821AU: GenMAC device WRND32$ only.");
+         }
          {
             static char lanmsg[] = "RTL8821AU: TCP/IP interface: lan0.";
 
@@ -211,12 +216,15 @@ static void rt_init(RP_INIT FAR *rp)
          say("RTL8821AU: Driver loaded without warnings.");
       }
    }
-   if (g_opt_w)
-      say("RTL8821AU: Realtek RTL8821AU USB WLAN driver " DRV_VERSION ". The boot pauses 30 seconds after all drivers are loaded so the messages can be read.");
-   if (rtl8821_fw_load() != 0)
-      say("RTL8821AU: the firmware buffer could not be allocated - the adapter will not start.");
-   else if (g_opt_v)
-      say("RTL8821AU: firmware buffer ready; load the image with: copy /b \\IBMCOM\\MACS\\RTL8821AU.FW \\DEV\\WRND32$");
+   if (g_opt_w) {
+      say("RTL8821AU: Realtek RTL8821AU USB WLAN driver " DRV_VERSION ".");
+      say("RTL8821AU: The boot pauses 30 seconds after all drivers are loaded");
+      say("RTL8821AU: so the messages can be read.");
+   }
+   if (rtl8821_fw_load() != 0) {
+      say("RTL8821AU: the firmware buffer could not be allocated.");
+      say("RTL8821AU: The adapter will not start.");
+   }
    tcom_always('I'); tcom_always('5');
    if (dhcp_init() != 0 || dbg_init() != 0)      /* mapping calls also reject a missing selector */
       say("RTL8821AU: warning - GDT selector allocation failed; the text READ/WRITE channel is disabled.");
