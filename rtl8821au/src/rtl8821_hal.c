@@ -129,7 +129,11 @@ int rtl8821_fw_write(ULONG phys, USHORT n)
       fwsel_unlock();
       return 0;
    }
-   if (rt_dh_phys_to_gdt_sel(g_fw_phys, n, g_fw_sel, GDTSEL_R0DATA) != 0) {
+   /* Write through the image selector: PhysToGDTSel (54h) first, PhysToGDTSelector (2Eh) as the fallback
+    * (2Eh is what MultiMac's nveth and e1000e write through). R21FWLOAD=5 reports that both failed. */
+   if (rt_dh_phys_to_gdt_sel(g_fw_phys, n, g_fw_sel, GDTSEL_R0DATA) != 0 &&
+       rt_dh_phys_to_gdt(g_fw_phys, n, g_fw_sel) != 0) {
+      g_r21_fwload = 5;
       fwsel_unlock();
       return 0;
    }

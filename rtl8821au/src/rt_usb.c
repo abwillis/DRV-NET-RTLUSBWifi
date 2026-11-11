@@ -202,24 +202,23 @@ USHORT g_u_acc, g_u_done, g_u_stat, g_u_wait;     /* debug: last synchronous req
 static USHORT xfer_wait(ULONG timeout)
 {
    USHORT done;
-   ULONG  start = rtl8188eu_ms(), spent;
-   USHORT tries = 0;
+   ULONG  start = rtl8188eu_ms(), spent, remain;   /* clock read before interrupts go off (first call maps the info segment) */
 
-   /* DDK ProcBlock remarks: always re-check the condition after a wakeup; a wakeup is not proof of completion.
-    * Loop until done or the full timeout has elapsed. Uninterruptible: a transfer is short, and abandoning one
-    * midway through a join leaves the chip half-programmed. */
+   /* One ProcBlock per pass, then re-test the flag with interrupts off (DDK ProcBlock remarks: a wakeup is not proof
+    * that the awaited event happened). The pass count is bounded by the clock: stop when the full timeout has run. */
    rt_cli();
    while (!g_xfer.done) {
-      spent = rtl8188eu_ms() - start;
-      if (spent >= timeout)
-         break;
-      rt_dh_procblock(EVT_XFER, timeout - spent, WAIT_UNINTERRUPTIBLE);
-      spent = start ? (rtl8188eu_ms() - start) : timeout;   /* no clock: one full-length block only */
-      if ((spent >= timeout && tries) || tries > 16)       /* bounded even if the clock is stuck */
-         break;
-      tries++;
-      rt_dh_procblock(EVT_XFER, spent < timeout ? timeout - spent : timeout, WAIT_UNINTERRUPTIBLE);
-      rt_cli();
+      if (start) {
+         spent = rtl8188eu_ms() - start;
+         if (spent >= timeout)
+            break;
+         remain = timeout - spent;
+      } else
+         remain = timeout;
+      rt_dh_procblock(EVT_XFER, remain, WAIT_UNINTERRUPTIBLE);
+      rt_cli();                                 /* ProcBlock returns with interrupts enabled */
+      if (!start)
+         break;                                 /* no clock: a stray wakeup cannot be told from a timeout, so block once only */
    }
    done = g_xfer.done;
    rt_sti();

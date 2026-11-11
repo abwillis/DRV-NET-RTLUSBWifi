@@ -702,9 +702,6 @@ void rtl8188eu_genmac_ioctl(RP_GENIOCTL FAR *rp)
 #endif
    par[1] = g_st;
    par[2] = g_olen;
-   if (rp->ParmLen >= 16 &&
-       !rt_dh_verify(SELECTOROF(rp->ParmPacket), 16, OFFSETOF(rp->ParmPacket), VERIFY_READWRITE))
-      par[3] = g_st;                      /* genmac.dim looks for the NDIS status here */
    /* ParmLen 0 = 16-bit DosDevIOCtl caller (PDD reference, command 10h remarks); the block is four ULONGs. */
    if ((rp->ParmLen == 0 || rp->ParmLen >= 16) &&
        !rt_dh_verify(SELECTOROF(rp->ParmPacket), 16, OFFSETOF(rp->ParmPacket), VERIFY_READWRITE))

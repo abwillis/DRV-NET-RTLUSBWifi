@@ -172,6 +172,8 @@ static void rt_init(RP_INIT FAR *rp)
    rc = rt_dh_attach_dd(usbd, idc);
    if (rc) {
       say("RTL8821AU: could not be loaded. USB stack (USBD$) not found - load the USB drivers before it.");
+      rp->p1.End.CodeEnd = 0;                 /* failed INIT: Pointer_1 = 0000:0000 (PDD INIT remarks) */
+      rp->p1.End.DataEnd = 0;
       rp->rph.Status |= STDON | STERR | ERROR_I24_GEN_FAILURE;
       return;
    }

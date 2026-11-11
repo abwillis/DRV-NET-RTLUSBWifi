@@ -412,7 +412,8 @@ USHORT rtl8188eu_dhcp_read(ULONG phys, USHORT max)
    if (n > max) n = max;
    if (n && g_rdsel) {
       rdsel_lock();
-      if (rt_dh_phys_to_gdt_sel(phys, n, g_rdsel, GDTSEL_R0DATA) == 0)
+      if (rt_dh_phys_to_gdt_sel(phys, n, g_rdsel, GDTSEL_R0DATA) == 0 ||
+          rt_dh_phys_to_gdt(phys, n, g_rdsel) == 0)      /* 54h first; 2Eh is what MultiMac writes through */
          rt_movmem((PSZ)MAKEP(g_rdsel, 0), (PSZ)g_text, n);
       else
          n = 0;
